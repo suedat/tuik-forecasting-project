@@ -4,6 +4,9 @@
 
 This project produces a one-step-ahead forecast for the annual total cinema audience in Türkiye using time series methods applied to data published by TÜİK. Six applicable forecasting methods are compared on standard accuracy measures, and the most suitable method is selected on both numerical and structural grounds. The forecast target is the next unpublished period: 2026.
 
+<img width="786" height="550" alt="Screenshot 2026-06-03 at 08 42 12" src="https://github.com/user-attachments/assets/fb43793f-08c5-4ca5-9a4f-3602e1a00ee7" />
+
+
 ## 2. Data Source and TÜİK Connection
 
 Data are accessed directly from the TÜİK Data Portal through the `tuikr` R package. No data file is bundled with this repository; the source Excel sheet is fetched at knit time using the URL returned by `tuikr::statistical_tables()` and downloaded inside R with `httr::GET()`.
