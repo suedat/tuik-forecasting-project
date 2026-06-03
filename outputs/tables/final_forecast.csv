@@ -1,0 +1,2 @@
+"SuperiorMethod","DataAccessDate","LatestObservation_Year","LatestObservation_Value","ForecastTargetPeriod","ForecastedValue","MAD","MAPE","TrackingSignal"
+"Exponential Smoothing","2026-06-03",2025,27657591,2026,27658079,6222588,23.3,1.08

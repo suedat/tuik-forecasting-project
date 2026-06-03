@@ -1,0 +1,540 @@
+---
+title: "TÜİK Forecasting Project — Cinema Audience"
+author: "Sueda Turgut"
+date: "2026-06-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Student Information
+
+- **Name:** Sueda Turgut
+- **Student number:** 138721013
+- **Course:** Quantitative Analysis for DM
+
+# Project Overview
+
+This project produces a one-step-ahead forecast for the annual cinema audience in Türkiye using data published by TÜİK. The latest observation in the source table is 2025, so the forecast target is 2026.
+
+Several quantitative methods are compared and the most appropriate one is selected based on both forecast accuracy and the structure of the series.
+
+# Data Source
+
+| Field | Value |
+|---|---|
+| Dataset | Sinema, Gösterilen Film ve Seyirci Sayısı |
+| Theme | Kültür ve Spor (theme_id = 10) |
+| Table type | `istab` (file download) |
+| Selected variable | Total cinema audience (annual) |
+| Frequency | Annual |
+| Time coverage | 2000–2025 |
+| Latest observation | 2025 |
+| Forecast target | 2026 |
+| Date of data access | `r format(Sys.Date(), "%d %B %Y")` |
+| R package for access | `tuikr` (https://github.com/emraher/tuikr) |
+
+The cinema table is published by TÜİK only as a downloadable file (no SDMX dataflow). The download URL is obtained from `tuikr::statistical_tables()`, and the file itself is fetched inside R with `httr::GET()`. As you agreed in the email, hocam.
+# Setup
+
+```{r packages}
+library(tuikr)
+library(httr)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(forecast)
+library(scales)
+library(knitr)
+```
+
+# Data Access
+
+```{r locate-table}
+culture_tables <- statistical_tables("10", lang = "tr")
+
+cinema_tables <- culture_tables %>%
+  filter(grepl("Sinema|Cinema", table_name, ignore.case = TRUE))
+
+cinema_tables
+```
+
+Two entries appear, both pointing at the same underlying file (different URL tokens). Either works; the first is used.
+
+```{r download}
+cinema_url <- cinema_tables$table_url[1]
+
+tmp_file <- tempfile(fileext = ".xls")
+
+# TÜİK's download endpoint returns 403 without a browser-like User-Agent
+GET(
+  cinema_url,
+  user_agent("Mozilla/5.0 (compatible; tuikr-forecasting-project)"),
+  write_disk(tmp_file, overwrite = TRUE)
+)
+
+raw_data <- read_excel(tmp_file, sheet = 1, col_names = FALSE)
+```
+
+# Data Preparation
+
+The downloaded file has four header rows. Year–audience rows occupy rows 5–30 (2000–2025); rows 31 onward are footer notes. The total audience is in column `...9`.
+
+```{r clean}
+cinema_clean <- raw_data[5:30, c("...1", "...9")]
+colnames(cinema_clean) <- c("year", "audience")
+
+cinema_clean$year     <- as.integer(cinema_clean$year)
+cinema_clean$audience <- as.numeric(cinema_clean$audience)
+
+cinema_clean <- cinema_clean %>% arrange(year)
+
+# Sanity checks
+stopifnot(
+  nrow(cinema_clean) == 26,
+  sum(is.na(cinema_clean)) == 0,
+  min(cinema_clean$year) == 2000,
+  max(cinema_clean$year) == 2025
+)
+
+kable(cinema_clean, caption = "Cinema audience, Türkiye, 2000–2025",
+      format.args = list(big.mark = ","))
+```
+
+```{r ts-object}
+cinema_ts <- ts(cinema_clean$audience, start = 2000, frequency = 1)
+```
+
+# Exploratory Analysis
+
+```{r structural-plot, fig.cap = "Annual cinema audience, Türkiye, 2000–2025"}
+cinema_clean$period <- case_when(
+  cinema_clean$year <= 2007 ~ "Stagnant (2000–2007)",
+  cinema_clean$year <= 2019 ~ "Growth (2008–2019)",
+  cinema_clean$year <= 2021 ~ "COVID affect (2020–2021)",
+  TRUE ~ "Recovery (2022–2025)"
+)
+
+cinema_clean$period <- factor(cinema_clean$period,
+  levels = c("Stagnant (2000–2007)", "Growth (2008–2019)",
+             "COVID affect (2020–2021)", "Recovery (2022–2025)"))
+
+p_main <- ggplot(cinema_clean, aes(x = year, y = audience)) +
+  geom_line(color = "gray50", linewidth = 0.7) +
+  geom_point(aes(color = period), size = 3) +
+  scale_y_continuous(labels = label_number(big.mark = ".", scale = 1e-6, suffix = "M")) +
+  scale_color_manual(values = c("gray40", "steelblue", "firebrick", "forestgreen")) +
+  labs(
+    title = "Cinema Audience in Türkiye, 2000–2025",
+    subtitle = "Four structural periods",
+    x = "Year", y = "Audience",
+    color = "Period",
+    caption = "Source: TÜİK, Cinema and Performing Arts Statistics"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+if (!dir.exists("outputs/figures")) dir.create("outputs/figures", recursive = TRUE)
+ggsave("outputs/figures/actual_series_plot.png", p_main,
+       width = 10, height = 6, dpi = 150)
+
+p_main
+```
+
+The series shows four distinct phases:
+
+- **Stagnant (2000–2007).** Audience oscillates between 14M and 23M with no clear direction. The cinema market is mature but not expanding.
+- **Growth (2008–2019).** A strong, sustained upward trend. Audience more than doubles, peaking at 68.5M in 2017.
+- **COVID affect (2020–2021).** Audience collapses to 17M and then 12M as cinemas close.
+- **Recovery (2022–2025).** A partial rebound stabilizes the series around 28–35M — well below the pre-pandemic peak.
+
+**Trend.** A long-run upward tendency exists, but it is interrupted by a major structural break in 2020. Fitting a single trend through the whole series would average two very different regimes.
+
+**Seasonality.** None — the data are annual. This rules out four of the ten required methods (Seasonal Indices, Additive Decomposition, Multiplicative Decomposition, Regression with Seasonal Dummies).
+
+**Outliers.** 2020 and 2021 are not noise; they are the pandemic. They are kept in the series rather than removed, because doing otherwise would erase a real and explanatory event.
+
+**Implication for method choice.** Methods that weight recent observations heavily (weighted moving average, exponential smoothing with high α) are likely to outperform methods that treat all observations equally (linear trend, simple moving average with a long window).
+
+# Forecasting Methods
+
+Ten methods are required by the assignment. Six of them are applicable to an annual univariate series; the remaining four require seasonal structure and are not applicable here — they are documented and justified later in this section.
+
+A small helper computes the standard accuracy measures from a vector of actual values and a vector of fitted/forecast values.
+
+```{r accuracy-helper}
+accuracy_measures <- function(actual, forecast) {
+  errors <- actual - forecast
+  abs_err <- abs(errors)
+  
+  bias   <- mean(errors, na.rm = TRUE)
+  mad    <- mean(abs_err, na.rm = TRUE)
+  mse    <- mean(errors^2, na.rm = TRUE)
+  mape   <- mean(abs_err / actual, na.rm = TRUE) * 100
+  rsfe   <- sum(errors, na.rm = TRUE)
+  ts_val <- rsfe / mad
+  
+  data.frame(
+    Bias = bias, MAD = mad, MSE = mse,
+    MAPE = mape, RSFE = rsfe, TrackingSignal = ts_val
+  )
+}
+```
+
+A second helper draws actual-vs-forecast plots in a consistent style and saves a PNG to `outputs/figures/`.
+
+```{r plot-helper}
+plot_method <- function(years, actual, fitted, next_year, next_forecast,
+                        title_text, file_name) {
+  df_hist <- data.frame(year = years, actual = actual, fitted = fitted)
+  df_fcst <- data.frame(year = next_year, forecast = next_forecast)
+  
+  p <- ggplot() +
+    geom_line(data = df_hist, aes(x = year, y = actual, color = "Actual"),
+              linewidth = 0.7) +
+    geom_point(data = df_hist, aes(x = year, y = actual, color = "Actual"), size = 2) +
+    geom_line(data = df_hist, aes(x = year, y = fitted, color = "Fitted"),
+              linewidth = 0.7, linetype = "dashed") +
+    geom_point(data = df_fcst, aes(x = year, y = forecast, color = "Forecast"),
+               size = 4, shape = 17) +
+    scale_color_manual(values = c("Actual" = "gray30", "Fitted" = "steelblue",
+                                  "Forecast" = "firebrick")) +
+    scale_y_continuous(labels = label_number(big.mark = ".", scale = 1e-6, suffix = "M")) +
+    labs(title = title_text, x = "Year", y = "Audience", color = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+  
+  ggsave(file.path("outputs/figures", file_name), p,
+         width = 9, height = 5, dpi = 150)
+  p
+}
+```
+
+## Naïve Forecasting
+
+The Naïve method uses the most recent observation as the forecast for the next period. Fitted values are the previous year's actual.
+
+```{r naive}
+years   <- cinema_clean$year
+audience <- cinema_clean$audience
+n <- length(audience)
+
+naive_fitted <- c(NA, audience[-n])
+
+naive_next <- audience[n]
+
+naive_acc <- accuracy_measures(audience[-1], naive_fitted[-1])
+naive_acc
+
+plot_method(years, audience, naive_fitted,
+            next_year = 2026, next_forecast = naive_next,
+            title_text = "Naïve Forecast",
+            file_name = "naive_forecast_plot.png")
+```
+
+The Naïve forecast for 2026 is the 2025 value: **`r format(naive_next, big.mark = ",")`**. The method ignores all earlier history. It is included as a baseline: any more sophisticated method has to beat it.
+
+## Moving Average
+
+A 3-year window is used. Longer windows (5, 7) drag in pre-pandemic levels that are no longer representative; a 3-year window covers the post-recovery period (2022–2025) without contamination from the COVID dip.
+
+```{r moving-average}
+ma_window <- 3
+
+ma_fitted <- rep(NA, n)
+for (i in (ma_window + 1):n) {
+  ma_fitted[i] <- mean(audience[(i - ma_window):(i - 1)])
+}
+
+ma_next <- mean(audience[(n - ma_window + 1):n])
+
+ma_acc <- accuracy_measures(
+  audience[(ma_window + 1):n],
+  ma_fitted[(ma_window + 1):n]
+)
+ma_acc
+
+plot_method(years, audience, ma_fitted,
+            next_year = 2026, next_forecast = ma_next,
+            title_text = paste0("Moving Average (window = ", ma_window, ")"),
+            file_name = "moving_average_plot.png")
+```
+
+The 2026 forecast is the mean of 2023–2024–2025: **`r format(round(ma_next), big.mark = ",")`**.
+
+## Weighted Moving Average
+
+The same 3-year window, but the most recent year gets the highest weight. Given that the series stabilized only recently, leaning on the latest observation is justified.
+
+Weights: 0.5 / 0.3 / 0.2 for the most recent, second most recent, and third most recent year.
+
+```{r weighted-ma}
+wma_weights <- c(0.2, 0.3, 0.5)
+stopifnot(sum(wma_weights) == 1)
+
+wma_fitted <- rep(NA, n)
+for (i in (ma_window + 1):n) {
+  wma_fitted[i] <- sum(audience[(i - ma_window):(i - 1)] * wma_weights)
+}
+
+wma_next <- sum(audience[(n - ma_window + 1):n] * wma_weights)
+
+wma_acc <- accuracy_measures(
+  audience[(ma_window + 1):n],
+  wma_fitted[(ma_window + 1):n]
+)
+wma_acc
+
+plot_method(years, audience, wma_fitted,
+            next_year = 2026, next_forecast = wma_next,
+            title_text = "Weighted Moving Average (0.2 / 0.3 / 0.5)",
+            file_name = "weighted_moving_average_plot.png")
+```
+
+The 2026 forecast is **`r format(round(wma_next), big.mark = ",")`** — slightly different from the simple MA because more weight is placed on 2025.
+
+## Exponential Smoothing
+
+Simple exponential smoothing with a smoothing parameter α. With a structural break in 2020, recent observations matter more than older ones, so a high α is appropriate. The `forecast::ses()` function selects α by minimizing in-sample SSE, which provides a data-driven value rather than an arbitrary one.
+
+```{r exp-smoothing}
+ses_model <- ses(cinema_ts, h = 1)
+
+ses_alpha   <- ses_model$model$par["alpha"]
+ses_fitted  <- as.numeric(fitted(ses_model))
+ses_next    <- as.numeric(ses_model$mean)
+
+ses_acc <- accuracy_measures(audience, ses_fitted)
+ses_acc
+
+cat("Optimized alpha:", round(ses_alpha, 4), "\n")
+cat("2026 forecast:", format(round(ses_next), big.mark = ","), "\n")
+
+plot_method(years, audience, ses_fitted,
+            next_year = 2026, next_forecast = ses_next,
+            title_text = paste0("Simple Exponential Smoothing (α = ", round(ses_alpha, 3), ")"),
+            file_name = "exponential_smoothing_plot.png")
+```
+
+A high α means the forecast tracks recent levels closely; a low α would mean heavy reliance on the long-run average — which would be misleading here, given how different the pre- and post-COVID levels are.
+
+## Trend-Adjusted Exponential Smoothing (Holt)
+
+Holt's method extends simple ES with a separate component for trend. It is included because the series does show a long-run trend, but the result has to be read with caution: if Holt locks onto the post-COVID trajectory, the trend component could either chase the recovery upward or get dragged down by the soft 2023–2025 plateau.
+
+```{r holt}
+holt_model <- holt(cinema_ts, h = 1)
+
+holt_alpha <- holt_model$model$par["alpha"]
+holt_beta  <- holt_model$model$par["beta"]
+holt_fitted <- as.numeric(fitted(holt_model))
+holt_next   <- as.numeric(holt_model$mean)
+
+holt_acc <- accuracy_measures(audience, holt_fitted)
+holt_acc
+
+cat("Alpha (level):", round(holt_alpha, 4), "\n")
+cat("Beta (trend):", round(holt_beta, 4), "\n")
+cat("2026 forecast:", format(round(holt_next), big.mark = ","), "\n")
+
+plot_method(years, audience, holt_fitted,
+            next_year = 2026, next_forecast = holt_next,
+            title_text = paste0("Holt (α=", round(holt_alpha, 3),
+                                ", β=", round(holt_beta, 3), ")"),
+            file_name = "trend_adjusted_smoothing_plot.png")
+```
+
+## Linear Trend Projection
+
+A simple OLS regression of audience on year. The series **does** have an overall upward trend, but the 2020 structural break means a single straight line cannot represent both regimes well. The method is included because it is required, and its weakness in this context is itself informative.
+
+```{r linear-trend}
+trend_data <- data.frame(t = seq_along(audience), audience = audience)
+trend_model <- lm(audience ~ t, data = trend_data)
+
+summary(trend_model)
+
+trend_fitted <- as.numeric(fitted(trend_model))
+trend_next   <- as.numeric(predict(trend_model,
+                                   newdata = data.frame(t = n + 1)))
+
+trend_acc <- accuracy_measures(audience, trend_fitted)
+trend_acc
+
+cat("Intercept:", format(round(coef(trend_model)[1]), big.mark = ","), "\n")
+cat("Slope:", format(round(coef(trend_model)[2]), big.mark = ","), "per year\n")
+cat("2026 forecast:", format(round(trend_next), big.mark = ","), "\n")
+
+plot_method(years, audience, trend_fitted,
+            next_year = 2026, next_forecast = trend_next,
+            title_text = "Linear Trend Projection",
+            file_name = "trend_projection_plot.png")
+```
+
+The slope is positive — historically the audience grew by a few hundred thousand viewers per year — but the residuals are large around 2020–2021 and around the 2017–2019 peak, which is the structural-break problem made visible.
+
+## Methods Not Applicable to This Series
+
+Four of the ten required methods cannot be applied to this dataset. The data are annual (one observation per year), so they contain no within-year recurring pattern that could be modeled as seasonal. Stating this once and applying it to all four methods would be glib; each is briefly addressed below.
+
+### Seasonal Indices
+
+Seasonal indices require recurring sub-annual periods (e.g., quarters or months) so that an average index per season can be computed across multiple cycles. With one observation per year, no such cycle exists. The method is omitted on structural, not numerical, grounds.
+
+### Additive Decomposition
+
+Classical additive decomposition splits a series into trend, seasonal, and random components. Without a seasonal frequency higher than 1, the decomposition reduces to trend plus residuals, which is already covered by the Linear Trend projection. `decompose()` and `stl()` in R both refuse to run on a series with `frequency = 1`, which is the technical confirmation of the structural argument.
+
+### Multiplicative Decomposition
+
+The same structural objection as additive decomposition. The multiplicative form would additionally require strictly positive observations *and* a meaningful proportional seasonal pattern — neither of which is relevant when the seasonal dimension does not exist.
+
+### Regression with Trend and Seasonal Dummy Variables
+
+A regression of the form `audience ~ t + season_dummies` needs season dummies to encode. With annual data, every observation belongs to a single "season" — the year itself — so the dummies collapse and the model degenerates into the plain trend regression already estimated above.
+
+In short: all four methods presuppose a seasonal structure that annual data do not have. They are not omitted for convenience but ruled out by the data frequency.
+
+# Forecast Accuracy Comparison
+
+The six applicable methods are compared on the standard accuracy and monitoring measures: Bias, MAD, MSE, MAPE, RSFE, and Tracking Signal. The four seasonal methods appear in the table for completeness, marked as not applicable.
+
+```{r comparison-table}
+method_results <- bind_rows(
+  cbind(Method = "Naive",                     naive_acc, NextForecast = naive_next),
+  cbind(Method = "Moving Average (3-yr)",     ma_acc,    NextForecast = ma_next),
+  cbind(Method = "Weighted MA (.2/.3/.5)",    wma_acc,   NextForecast = wma_next),
+  cbind(Method = "Exponential Smoothing",     ses_acc,   NextForecast = ses_next),
+  cbind(Method = "Holt (Trend-Adjusted ES)",  holt_acc,  NextForecast = holt_next),
+  cbind(Method = "Linear Trend",              trend_acc, NextForecast = trend_next)
+)
+
+na_methods <- data.frame(
+  Method = c("Seasonal Indices",
+             "Additive Decomposition",
+             "Multiplicative Decomposition",
+             "Regression w/ Seasonal Dummies"),
+  Bias = NA, MAD = NA, MSE = NA, MAPE = NA, RSFE = NA,
+  TrackingSignal = NA, NextForecast = NA
+)
+
+comparison_table <- bind_rows(method_results, na_methods)
+
+if (!dir.exists("outputs/tables")) dir.create("outputs/tables", recursive = TRUE)
+write.csv(comparison_table, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+
+kable(comparison_table,
+      caption = "Accuracy comparison across forecasting methods",
+      digits = 2,
+      format.args = list(big.mark = ","))
+```
+
+A few patterns stand out:
+
+- **Linear Trend** has the largest MAD and MSE. Forcing a single straight line through both the pre-COVID growth phase and the post-COVID plateau produces large residuals at both ends.
+- **Naïve** does surprisingly well on point accuracy but its Tracking Signal can drift, because it carries no correction mechanism — once it is off, it stays off until the next observation arrives.
+- **Weighted MA and Exponential Smoothing** sit in a similar place: both lean on recent observations, which is the right behavior for a series with a structural break.
+- **Holt** can either look reasonable or look distorted depending on how the optimizer set the trend coefficient on this short, broken series.
+
+# Selection of the Superior Method
+
+Picking the lowest-MAPE method mechanically is not enough — the assignment requires that the chosen method also fits the structure of the data. The two questions are: which method produced the smallest errors, and is that method a sensible description of how this series behaves?
+
+```{r select-best}
+applicable <- method_results %>%
+  arrange(MAPE)
+
+kable(applicable[, c("Method", "MAD", "MAPE", "TrackingSignal", "NextForecast")],
+      caption = "Applicable methods, ranked by MAPE",
+      digits = 2,
+      format.args = list(big.mark = ","))
+
+best_method_name <- applicable$Method[1]
+best_forecast    <- applicable$NextForecast[1]
+best_mad         <- applicable$MAD[1]
+best_mape        <- applicable$MAPE[1]
+best_ts          <- applicable$TrackingSignal[1]
+```
+
+The top entry by MAPE is **`r best_method_name`**, with MAPE `r round(best_mape, 2)`% and Tracking Signal `r round(best_ts, 2)`. Beyond the numbers, this choice is defensible on structural grounds:
+
+- The series has a clear regime shift in 2020. Methods that weight recent observations more heavily are the appropriate response.
+- The Tracking Signal is within the conventional ±4 band, so there is no evidence of systematic bias.
+- A short window (or a high smoothing parameter) avoids contaminating the forecast with pre-pandemic levels that no longer represent the market.
+
+Linear Trend, despite being a textbook method, is rejected here on structural grounds even where its numerical MAD looks tolerable: it predicts roughly 40M for 2026, which is well above the 28–35M range the series has held for four years.
+
+# Final Next-Period Forecast
+
+```{r final-forecast}
+final_forecast_row <- data.frame(
+  SuperiorMethod = best_method_name,
+  DataAccessDate = format(Sys.Date(), "%Y-%m-%d"),
+  LatestObservation_Year = max(cinema_clean$year),
+  LatestObservation_Value = cinema_clean$audience[n],
+  ForecastTargetPeriod = 2026,
+  ForecastedValue = round(best_forecast),
+  MAD = round(best_mad),
+  MAPE = round(best_mape, 2),
+  TrackingSignal = round(best_ts, 2)
+)
+
+write.csv(final_forecast_row, "outputs/tables/final_forecast.csv", row.names = FALSE)
+
+kable(t(final_forecast_row),
+      caption = "Final forecast result",
+      col.names = "Value",
+      format.args = list(big.mark = ","))
+```
+
+The forecast for cinema audience in Türkiye in 2026 is **`r format(round(best_forecast), big.mark = ",")`** viewers, produced by the **`r best_method_name`** method.
+
+```{r superior-method-plot, fig.cap = "Superior method: actual series, fitted values, and 2026 forecast"}
+fitted_lookup <- list(
+  "Naive"                     = naive_fitted,
+  "Moving Average (3-yr)"     = ma_fitted,
+  "Weighted MA (.2/.3/.5)"    = wma_fitted,
+  "Exponential Smoothing"     = ses_fitted,
+  "Holt (Trend-Adjusted ES)"  = holt_fitted,
+  "Linear Trend"              = trend_fitted
+)
+
+best_fitted <- fitted_lookup[[best_method_name]]
+
+plot_method(years, audience, best_fitted,
+            next_year = 2026, next_forecast = best_forecast,
+            title_text = paste0("Final forecast — ", best_method_name,
+                                " — 2026: ",
+                                format(round(best_forecast), big.mark = ",")),
+            file_name = "superior_method_plot.png")
+```
+
+**Interpretation.** A forecast of roughly `r format(round(best_forecast / 1e6, 1), nsmall = 1)`M viewers for 2026 says that the cinema market in Türkiye is expected to remain near its post-pandemic plateau rather than return to pre-COVID highs. The forecast is built almost entirely from the 2022–2025 recovery period, which is what makes it credible: it does not pretend the 2017 peak (68.5M) is around the corner, nor does it project the 2020–2021 collapse as the new normal. Whether the market eventually rebounds further or settles permanently at this level is a question the next few years of TÜİK releases will answer.
+
+
+# Limitations
+
+This forecast should be read with several caveats in mind.
+
+**Short series, one structural break.** Twenty-six annual observations is a workable length for the simpler methods, but the 2020–2021 pandemic introduces a regime shift that splits the series into two short sub-periods. The post-COVID window is only four years long, which limits how confidently any method can characterize the "new normal."
+
+**The winning method nearly collapses to Naïve.** Exponential smoothing produced the best MAPE, but its optimized α is close to 1, which means the model is leaning almost entirely on the most recent observation. The numerical victory is real, but the underlying logic is "yesterday is the best forecast for tomorrow." This is a reasonable response to a broken series — but it is also a signal that no method here is genuinely extracting structure beyond level.
+
+**MAPE around 23% is high in absolute terms.** Even the best method has a mean absolute percentage error of roughly 23%. On a 28M-viewer base, that is a several-million-viewer band of uncertainty around any point forecast.
+
+**Possible future structural changes are not modeled.** A wider release of high-profile domestic films, a new wave of ticket-price changes, streaming competition, or another public-health disruption could push the 2026 outcome well outside what historical data suggest. The forecast captures the recent equilibrium, not the next shock.
+
+**Methodology change on the source side.** Starting with the 2024 release, TÜİK changed how cinema statistics are sourced (now drawn from Ministry of Culture and Tourism administrative records). The audience series itself appears continuous, but related variables on the same table (e.g., film counts) show large jumps that are administrative rather than economic. Future revisions to the audience figures themselves are not impossible.
+
+**Annual frequency rules out half the toolkit.** Four of the ten required methods are inapplicable not for analytical reasons but because the data are annual. A monthly cinema-audience series, if available, would allow seasonal decomposition and seasonal-dummy regression and would almost certainly yield a richer story.
+
+# Reproducibility
+
+This analysis is fully reproducible from a clean machine. The TÜİK Excel file is not stored in the repository — it is fetched at knit time through the URL returned by `tuikr::statistical_tables()`, downloaded with `httr::GET()`, parsed with `readxl`, and cleaned in R. No manual step is involved.
+
+**Required packages:** `tuikr`, `httr`, `readxl`, `dplyr`, `ggplot2`, `forecast`, `scales`, `knitr`. Exact versions are pinned in `renv.lock`.
+
+
+
